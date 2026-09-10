@@ -21,7 +21,7 @@ If it says `Blocking ads (stripping)` in the top left of the stream then it's ac
 
 ## The script don't work on mobile (m.twitch.tv)
 
-There are no plans of implementing the scripts on m.twitch.tv but there are other solutions which blocking ads on Twitch for mobile. See https://github.com/pixeltris/TwitchAdSolutions/blob/master/full-list.md
+There are no plans of implementing the scripts on m.twitch.tv but there are other solutions which blocking ads on Twitch for mobile. See https://github.com/JohnFawkes/TwitchAdSolutions/blob/master/full-list.md
 
 ## Long black screen during ads
 
@@ -37,7 +37,7 @@ This happens because the script forces the player to consume multiple different 
 
 The script is configured to do this automatically for you:
 
-https://github.com/pixeltris/TwitchAdSolutions/blob/9cae451c04a9a94859da7de19c367b58afdd95bc/vaft/vaft.user.js#L49-L54
+https://github.com/JohnFawkes/TwitchAdSolutions/blob/89093822979f851531e5dda4e29e2c05f7a7be63/vaft/vaft.user.js#L48-L53
 
 - If it triggers but it still freezes try setting `PlayerBufferingDoPlayerReload` to `true`. Player reloads generally have less problems.
 - If you're having issues with it triggering when the player is genuinely buffering then adjust `PlayerBufferingDelay` / `PlayerBufferingSameStateCount`.
