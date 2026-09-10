@@ -45,6 +45,13 @@ https://github.com/pixeltris/TwitchAdSolutions/blob/9cae451c04a9a94859da7de19c36
 - If you don't want to use this and would like to fix the buffering manually yourself you can set `PlayerBufferingFix` to `false`.
 - Setting `AlwaysReloadPlayerOnAd` to `true` may reduce freezing issues when entering into ads.
 
+### Ads aren't being blocked / the player behaves oddly during ads
+
+Two options control how ads are detected and what's handed to the player. Both default to `true`:
+
+- `DetectAdsBySegmentTitle` - also treats a playlist as having ads when it contains segments which aren't titled `live`, rather than relying only on the ad daterange tag. Set this to `false` if a stream is wrongly detected as being in an ad break.
+- `RemoveAdTags` - removes the ad daterange tag from the playlist handed to the player, so the player doesn't run its own ad UI / ad timers over segments the script has already stripped. Set this to `false` if the player misbehaves while `Blocking ads (stripping)` is showing.
+
 ## `video-swap-new`
 
 ### Freezing / buffering during ads

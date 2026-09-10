@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TwitchAdSolutions (strip) - BAD, DON'T USE THIS
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      1.0
+// @version      1.1
 // @description  Multiple solutions for blocking Twitch ads (strip)
 // @updateURL    https://github.com/pixeltris/TwitchAdSolutions/raw/master/strip/strip.user.js
 // @downloadURL  https://github.com/pixeltris/TwitchAdSolutions/raw/master/strip/strip.user.js
@@ -13,7 +13,7 @@
 // ==/UserScript==
 (function() {
     'use strict';
-    const ourTwitchAdSolutionsVersion = 17;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 18;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping strip as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
         window.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
@@ -99,7 +99,9 @@
             constructor(twitchBlobUrl, options) {
                 let isTwitchWorker = false;
                 try {
-                    isTwitchWorker = new URL(twitchBlobUrl).origin.endsWith('.twitch.tv');
+                    const origin = new URL(twitchBlobUrl).origin;
+                    // 'twitch.tv' has no leading dot, so endsWith alone misses the apex domain
+                    isTwitchWorker = origin.endsWith('.twitch.tv') || origin === 'https://twitch.tv' || origin === 'http://twitch.tv';
                 } catch {}
                 if (!isTwitchWorker) {
                     super(twitchBlobUrl, options);
@@ -210,7 +212,14 @@
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                resolve(new Response(stripAdSegments(await response.text())));
+                                // Never let a processing error leave this promise unresolved (that hangs the player until it errors out)
+                                const responseText = await response.text();
+                                try {
+                                    resolve(new Response(stripAdSegments(responseText)));
+                                } catch (err) {
+                                    console.log('Failed to process the stream m3u8, using the unmodified response: ' + err);
+                                    resolve(new Response(responseText));
+                                }
                             } else {
                                 resolve(response);
                             }
@@ -229,21 +238,30 @@
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                const channelName = (new URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/)[0];
-                                let encodingsM3u8 = await response.text();
-                                const cachedM3u8 = M3U8ChannelCache.get(channelName);
-                                if (cachedM3u8 && (await realFetch(cachedM3u8.match(/^https:.*\.m3u8$/m)[0])).status === 200) {
-                                    encodingsM3u8 = replaceServerTimeInM3u8(cachedM3u8, getServerTimeFromM3u8(encodingsM3u8));
-                                } else if (encodingsM3u8.includes('.m3u8')) {
-                                    M3U8ChannelCache.set(channelName, encodingsM3u8);
-                                }
-                                const lines = encodingsM3u8.replaceAll('\r', '').split('\n');
-                                for (let i = 0; i < lines.length - 1; i++) {
-                                    if (lines[i].startsWith('#EXT-X-STREAM-INF') && lines[i + 1].includes('.m3u8')) {
-                                        M3U8Whitelist.add(lines[i + 1]);
+                                const responseText = await response.text();
+                                try {
+                                    const channelNameMatch = (new URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/);
+                                    let encodingsM3u8 = responseText;
+                                    const channelName = channelNameMatch ? channelNameMatch[0] : null;
+                                    const cachedM3u8 = channelName ? M3U8ChannelCache.get(channelName) : null;
+                                    const cachedStreamUrl = cachedM3u8 ? cachedM3u8.match(/^https:.*\.m3u8$/m) : null;
+                                    if (cachedStreamUrl && (await realFetch(cachedStreamUrl[0])).status === 200) {
+                                        encodingsM3u8 = replaceServerTimeInM3u8(cachedM3u8, getServerTimeFromM3u8(encodingsM3u8));
+                                    } else if (channelName && encodingsM3u8.includes('.m3u8')) {
+                                        M3U8ChannelCache.set(channelName, encodingsM3u8);
                                     }
+                                    const lines = encodingsM3u8.replaceAll('\r', '').split('\n');
+                                    for (let i = 0; i < lines.length - 1; i++) {
+                                        if (lines[i].startsWith('#EXT-X-STREAM-INF') && lines[i + 1].includes('.m3u8')) {
+                                            M3U8Whitelist.add(lines[i + 1]);
+                                        }
+                                    }
+                                    resolve(new Response(encodingsM3u8));
+                                } catch (err) {
+                                    // Never let a processing error leave this promise unresolved (that makes the stream look offline)
+                                    console.log('Failed to process the encodings m3u8, using the unmodified response: ' + err);
+                                    resolve(new Response(responseText));
                                 }
-                                resolve(new Response(encodingsM3u8));
                             } else {
                                 resolve(response);
                             }
@@ -263,12 +281,10 @@
         };
     }
     function getServerTimeFromM3u8(encodingsM3u8) {
-        if (V2API) {
-            const matches = encodingsM3u8.match(/#EXT-X-SESSION-DATA:DATA-ID="SERVER-TIME",VALUE="([^"]+)"/);
-            return matches.length > 1 ? matches[1] : null;
-        }
-        const matches = encodingsM3u8.match('SERVER-TIME="([0-9.]+)"');
-        return matches.length > 1 ? matches[1] : null;
+        const matches = V2API
+            ? encodingsM3u8.match(/#EXT-X-SESSION-DATA:DATA-ID="SERVER-TIME",VALUE="([^"]+)"/)
+            : encodingsM3u8.match(/SERVER-TIME="([0-9.]+)"/);
+        return matches && matches.length > 1 ? matches[1] : null;
     }
     function replaceServerTimeInM3u8(encodingsM3u8, newServerTime) {
         if (V2API) {
@@ -283,9 +299,8 @@
         const newAdUrl = 'https://twitch.tv';
         let isLastSegmentLive = false;
         for (let i = 0; i < lines.length; i++) {
-            let line = lines[i];
             // Remove tracking urls which appear in the overlay UI
-            line = line
+            const line = lines[i] = lines[i]
                 .replaceAll(/(X-TV-TWITCH-AD-URL=")(?:[^"]*)(")/g, `$1${newAdUrl}$2`)
                 .replaceAll(/(X-TV-TWITCH-AD-CLICK-TRACKING-URL=")(?:[^"]*)(")/g, `$1${newAdUrl}$2`);
             if (i < lines.length - 1 && line.startsWith('#EXTINF') && (!line.includes(',live') || stripAllSegments || AllSegmentsAreAdSegments)) {
@@ -324,7 +339,7 @@
             }
             NumStrippedSegments = 0;
         }
-        AdSegmentCache.forEach((key, value, map) => {
+        AdSegmentCache.forEach((value, key, map) => {
             if (value < Date.now() - 120000) {
                 map.delete(key);
             }

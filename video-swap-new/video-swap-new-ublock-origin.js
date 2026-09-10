@@ -1,7 +1,7 @@
 twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
-    const ourTwitchAdSolutionsVersion = 23;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping video-swap-new as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
         window.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
@@ -27,6 +27,9 @@ twitch-videoad.js text/javascript
         scope.IsAdStrippingEnabled = true;
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
+        scope.DetectAdsBySegmentTitle = true;// Also treat a playlist as having ads when it contains segments which aren't titled 'live' (a fallback for when the ad daterange tag is missing / renamed)
+        scope.RemoveAdTags = true;// Strip the ad metadata tags from the playlist handed to the player (stops the player running its own ad UI / ad timers when we can't swap to a clean stream)
+        scope.UseFullAccessTokenQuery = false;// Set automatically when the PlaybackAccessToken persisted query hash is rejected
     }
     let twitchPlayerAndState = null;
     let localStorageHookFailed = false;
@@ -94,7 +97,9 @@ twitch-videoad.js text/javascript
             constructor(twitchBlobUrl, options) {
                 let isTwitchWorker = false;
                 try {
-                    isTwitchWorker = new URL(twitchBlobUrl).origin.endsWith('.twitch.tv');
+                    const origin = new URL(twitchBlobUrl).origin;
+                    // 'twitch.tv' has no leading dot, so endsWith alone misses the apex domain
+                    isTwitchWorker = origin.endsWith('.twitch.tv') || origin === 'https://twitch.tv' || origin === 'http://twitch.tv';
                 } catch {}
                 if (!isTwitchWorker) {
                     super(twitchBlobUrl, options);
@@ -114,6 +119,7 @@ twitch-videoad.js text/javascript
                     ${getWasmWorkerJs.toString()}
                     ${getServerTimeFromM3u8.toString()}
                     ${replaceServerTimeInM3u8.toString()}
+                    ${hasNonLiveSegments.toString()}
                     ${getStreamUrlForResolution.toString()}
                     ${updateAdblockBannerForStream.toString()}
                     const workerString = getWasmWorkerJs('${twitchBlobUrl.replaceAll("'", "%27")}');
@@ -323,9 +329,8 @@ twitch-videoad.js text/javascript
         const lines = textStr.replaceAll('\r', '').split('\n');
         const newAdUrl = 'https://twitch.tv';
         for (let i = 0; i < lines.length; i++) {
-            let line = lines[i];
             // Remove tracking urls which appear in the overlay UI
-            line = line
+            const line = lines[i] = lines[i]
                 .replaceAll(/(X-TV-TWITCH-AD-URL=")(?:[^"]*)(")/g, `$1${newAdUrl}$2`)
                 .replaceAll(/(X-TV-TWITCH-AD-CLICK-TRACKING-URL=")(?:[^"]*)(")/g, `$1${newAdUrl}$2`);
             if (i < lines.length - 1 && line.startsWith('#EXTINF') && (!line.includes(',live') || stripAllSegments || AllSegmentsAreAdSegments)) {
@@ -344,6 +349,9 @@ twitch-videoad.js text/javascript
             for (let i = 0; i < lines.length; i++) {
                 // No low latency during ads (otherwise it's possible for the player to prefetch and display ad segments)
                 if (lines[i].startsWith('#EXT-X-TWITCH-PREFETCH:')) {
+                    lines[i] = '';
+                } else if (RemoveAdTags && lines[i].startsWith('#EXT-X-DATERANGE:') && lines[i].includes(AD_SIGNIFIER)) {
+                    // Drop the ad daterange so the player doesn't run its own ad UI / ad timers over the stripped segments
                     lines[i] = '';
                 }
             }
@@ -367,10 +375,10 @@ twitch-videoad.js text/javascript
         if (!currentResolution) {
             return textStr;
         }
-        const haveAdTags = textStr.includes(AD_SIGNIFIER) || (SimulatedAdsDepth > 0 && (!streamInfo.BackupEncodings || !streamInfo.BackupEncodings.includes(url) || SimulatedAdsDepth - 1 > streamInfo.BackupEncodingsPlayerTypeIndex));
+        const haveAdTags = textStr.includes(AD_SIGNIFIER) || (DetectAdsBySegmentTitle && hasNonLiveSegments(textStr)) || (SimulatedAdsDepth > 0 && (!streamInfo.BackupEncodings || !streamInfo.BackupEncodings.includes(url) || SimulatedAdsDepth - 1 > streamInfo.BackupEncodingsPlayerTypeIndex));
         if (streamInfo.BackupEncodings) {
-            const streamM3u8Url = streamInfo.Encodings.match(/^https:.*\.m3u8$/m)[0];
-            const streamM3u8Response = await realFetch(streamM3u8Url);
+            const streamM3u8Url = streamInfo.Encodings.match(/^https:.*\.m3u8$/m);
+            const streamM3u8Response = streamM3u8Url ? await realFetch(streamM3u8Url[0]) : { status: 0 };
             if (streamM3u8Response.status == 200) {
                 const streamM3u8 = await streamM3u8Response.text();
                 if (streamM3u8 != null) {
@@ -379,6 +387,7 @@ twitch-videoad.js text/javascript
                         streamInfo.IsMovingOffBackupEncodings = true;
                         streamInfo.BackupEncodings = null;
                         streamInfo.BackupEncodingsStatus.clear();
+                        streamInfo.RequestedAds.clear();
                         streamInfo.BackupEncodingsPlayerTypeIndex = -1;
                         postMessage({key:'UboReloadPlayer'});
                     } else if (!streamM3u8.includes('"MIDROLL"') && !streamM3u8.includes('"midroll"')) {
@@ -432,7 +441,14 @@ twitch-videoad.js text/javascript
                     return new Promise(function(resolve, reject) {
                         const processAfter = async function(response) {
                             if (response.status === 200) {
-                                const str = await processM3U8(url, await response.text(), realFetch);
+                                // Never let a processing error leave this promise unresolved (that hangs the player until it errors out)
+                                const responseText = await response.text();
+                                let str = responseText;
+                                try {
+                                    str = await processM3U8(url, responseText, realFetch);
+                                } catch (err) {
+                                    console.log('Failed to process the stream m3u8, using the unmodified response: ' + err);
+                                }
                                 resolve(new Response(str, {
                                     status: response.status,
                                     statusText: response.statusText,
@@ -455,7 +471,11 @@ twitch-videoad.js text/javascript
                 }
                 else if (url.includes('/channel/hls/') && !url.includes('picture-by-picture')) {
                     V2API = url.includes('/api/v2/');
-                    const channelName = (new URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/)[0];
+                    const channelNameMatch = (new URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/);
+                    if (!channelNameMatch) {
+                        return realFetch.apply(this, arguments);
+                    }
+                    const channelName = channelNameMatch[0];
                     if (OPT_FORCE_ACCESS_TOKEN_PLAYER_TYPE) {
                         // parent_domains is used to determine if the player is embeded and stripping it gets rid of fake ads
                         const tempUrl = new URL(url);
@@ -463,60 +483,70 @@ twitch-videoad.js text/javascript
                         url = tempUrl.toString();
                     }
                     return new Promise(async function(resolve, reject) {
-                        // - First m3u8 request is the m3u8 with the video encodings (360p,480p,720p,etc).
-                        // - Second m3u8 request is the m3u8 for the given encoding obtained in the first request. At this point we will know if there's ads.
-                        let streamInfo = StreamInfos[channelName];
-                        if (streamInfo != null && streamInfo.Encodings != null && (await realFetch(streamInfo.Encodings.match(/^https:.*\.m3u8$/m)[0])).status !== 200) {
-                            // The cached encodings are dead (the stream probably restarted)
-                            streamInfo = null;
-                        }
-                        let serverTime = null;
-                        if (streamInfo == null || streamInfo.Encodings == null) {
-                            StreamInfos[channelName] = streamInfo = {
-                                RequestedAds: new Set(),
-                                Encodings: null,
-                                BackupEncodings: null,
-                                BackupEncodingsStatus: new Map(),
-                                BackupEncodingsPlayerTypeIndex: -1,
-                                IsMovingOffBackupEncodings: false,
-                                IsMidroll: false,
-                                IsStrippingAdSegments: false,
-                                NumStrippedAdSegments: 0,
-                                UseFallbackStream: false,
-                                ChannelName: channelName,
-                                UsherParams: (new URL(url)).search,
-                                Urls: new Map(),
-                            };
-                            const encodingsM3u8Response = await realFetch(url, options);
-                            if (encodingsM3u8Response != null && encodingsM3u8Response.status === 200) {
-                                const encodingsM3u8 = await encodingsM3u8Response.text();
-                                streamInfo.Encodings = encodingsM3u8;
-                                setStreamInfoUrls(streamInfo, encodingsM3u8);
-                                serverTime = getServerTimeFromM3u8(encodingsM3u8);
-                                const resolutionInfo = streamInfo.Urls.values().next().value;
-                                const streamM3u8Response = await realFetch(resolutionInfo.Url);
-                                if (streamM3u8Response.status == 200) {
-                                    const streamM3u8 = await streamM3u8Response.text();
-                                    if (streamM3u8.includes(AD_SIGNIFIER) || SimulatedAdsDepth > 0) {
-                                        await onFoundAd(streamInfo, streamM3u8, false, realFetch, resolutionInfo.Url, resolutionInfo);
+                        try {
+                            // - First m3u8 request is the m3u8 with the video encodings (360p,480p,720p,etc).
+                            // - Second m3u8 request is the m3u8 for the given encoding obtained in the first request. At this point we will know if there's ads.
+                            let streamInfo = StreamInfos[channelName];
+                            if (streamInfo != null && streamInfo.Encodings != null) {
+                                const cachedStreamUrl = streamInfo.Encodings.match(/^https:.*\.m3u8$/m);
+                                if (!cachedStreamUrl || (await realFetch(cachedStreamUrl[0])).status !== 200) {
+                                    // The cached encodings are dead (the stream probably restarted)
+                                    streamInfo = null;
+                                }
+                            }
+                            let serverTime = null;
+                            if (streamInfo == null || streamInfo.Encodings == null) {
+                                StreamInfos[channelName] = streamInfo = {
+                                    RequestedAds: new Set(),
+                                    Encodings: null,
+                                    BackupEncodings: null,
+                                    BackupEncodingsStatus: new Map(),
+                                    BackupEncodingsPlayerTypeIndex: -1,
+                                    IsMovingOffBackupEncodings: false,
+                                    IsMidroll: false,
+                                    IsStrippingAdSegments: false,
+                                    NumStrippedAdSegments: 0,
+                                    UseFallbackStream: false,
+                                    ChannelName: channelName,
+                                    UsherParams: (new URL(url)).search,
+                                    Urls: new Map(),
+                                };
+                                const encodingsM3u8Response = await realFetch(url, options);
+                                if (encodingsM3u8Response != null && encodingsM3u8Response.status === 200) {
+                                    const encodingsM3u8 = await encodingsM3u8Response.text();
+                                    streamInfo.Encodings = encodingsM3u8;
+                                    setStreamInfoUrls(streamInfo, encodingsM3u8);
+                                    serverTime = getServerTimeFromM3u8(encodingsM3u8);
+                                    const resolutionInfo = streamInfo.Urls.values().next().value;
+                                    const streamM3u8Response = await realFetch(resolutionInfo.Url);
+                                    if (streamM3u8Response.status == 200) {
+                                        const streamM3u8 = await streamM3u8Response.text();
+                                        if (streamM3u8.includes(AD_SIGNIFIER) || SimulatedAdsDepth > 0) {
+                                            await onFoundAd(streamInfo, streamM3u8, false, realFetch, resolutionInfo.Url, resolutionInfo);
+                                        }
+                                    } else {
+                                        resolve(streamM3u8Response);
+                                        return;
                                     }
                                 } else {
-                                    resolve(streamM3u8Response);
+                                    resolve(encodingsM3u8Response);
                                     return;
                                 }
-                            } else {
-                                resolve(encodingsM3u8Response);
-                                return;
                             }
-                        }
-                        if (!serverTime) {
-                            const encodingsM3u8Response = await realFetch(url, options);
-                            if (encodingsM3u8Response != null && encodingsM3u8Response.status === 200) {
-                                serverTime = getServerTimeFromM3u8(await encodingsM3u8Response.text());
+                            if (!serverTime) {
+                                const encodingsM3u8Response = await realFetch(url, options);
+                                if (encodingsM3u8Response != null && encodingsM3u8Response.status === 200) {
+                                    serverTime = getServerTimeFromM3u8(await encodingsM3u8Response.text());
+                                }
                             }
+                            streamInfo.IsMovingOffBackupEncodings = false;
+                            resolve(new Response(replaceServerTimeInM3u8(streamInfo.BackupEncodings ? streamInfo.BackupEncodings : streamInfo.Encodings, serverTime)));
+                        } catch (err) {
+                            // Never let a processing error leave this promise unresolved (that makes the stream look offline)
+                            console.log('Failed to process the encodings m3u8: ' + err);
+                            StreamInfos[channelName] = null;
+                            realFetch(url, options).then(resolve).catch(reject);
                         }
-                        streamInfo.IsMovingOffBackupEncodings = false;
-                        resolve(new Response(replaceServerTimeInM3u8(streamInfo.BackupEncodings ? streamInfo.BackupEncodings : streamInfo.Encodings, serverTime)));
                     });
                 }
             }
@@ -524,18 +554,26 @@ twitch-videoad.js text/javascript
         }
     }
     function getServerTimeFromM3u8(encodingsM3u8) {
-        if (V2API) {
-            const matches = encodingsM3u8.match(/#EXT-X-SESSION-DATA:DATA-ID="SERVER-TIME",VALUE="([^"]+)"/);
-            return matches.length > 1 ? matches[1] : null;
-        }
-        const matches = encodingsM3u8.match('SERVER-TIME="([0-9.]+)"');
-        return matches.length > 1 ? matches[1] : null;
+        const matches = V2API
+            ? encodingsM3u8.match(/#EXT-X-SESSION-DATA:DATA-ID="SERVER-TIME",VALUE="([^"]+)"/)
+            : encodingsM3u8.match(/SERVER-TIME="([0-9.]+)"/);
+        return matches && matches.length > 1 ? matches[1] : null;
     }
     function replaceServerTimeInM3u8(encodingsM3u8, newServerTime) {
         if (V2API) {
             return newServerTime ? encodingsM3u8.replace(/(#EXT-X-SESSION-DATA:DATA-ID="SERVER-TIME",VALUE=")[^"]+(")/, `$1${newServerTime}$2`) : encodingsM3u8;
         }
         return newServerTime ? encodingsM3u8.replace(new RegExp('(SERVER-TIME=")[0-9.]+"'), `SERVER-TIME="${newServerTime}"`) : encodingsM3u8;
+    }
+    function hasNonLiveSegments(textStr) {
+        // Ad segments carry the ad type as their title instead of 'live'. This catches ads when the daterange tag is missing / renamed
+        const lines = textStr.replaceAll('\r', '').split('\n');
+        for (let i = 0; i < lines.length - 1; i++) {
+            if (lines[i].startsWith('#EXTINF') && !lines[i].includes(LIVE_SIGNIFIER)) {
+                return true;
+            }
+        }
+        return false;
     }
     function getStreamUrlForResolution(encodingsM3u8, resolutionInfo) {
         const encodingsLines = encodingsM3u8.replaceAll('\r', '').split('\n');
@@ -568,18 +606,30 @@ twitch-videoad.js text/javascript
         }
         return closestResolutionUrl.trimEnd();
     }
-    function getAccessToken(channelName, playerType) {
+    async function getAccessToken(channelName, playerType) {
         const realPlayerType = playerType.replace('-ALT', '');
+        const variables = {
+            isLive: true,
+            login: channelName,
+            isVod: false,
+            vodID: "",
+            playerType: realPlayerType,
+            platform: realPlayerType == 'autoplay' ? 'android' : 'web'
+        };
+        const fullQueryBody = {
+            operationName: 'PlaybackAccessToken_Template',
+            variables: variables,
+            query: 'query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!, $platform: String!) {'
+                + '  streamPlaybackAccessToken(channelName: $login, params: {platform: $platform, playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature __typename }'
+                + '  videoPlaybackAccessToken(id: $vodID, params: {platform: $platform, playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature __typename }'
+                + '}'
+        };
+        if (UseFullAccessTokenQuery) {
+            return gqlRequest(fullQueryBody, playerType);
+        }
         const body = {
             operationName: 'PlaybackAccessToken',
-            variables: {
-                isLive: true,
-                login: channelName,
-                isVod: false,
-                vodID: "",
-                playerType: realPlayerType,
-                platform: realPlayerType == 'autoplay' ? 'android' : 'web'
-            },
+            variables: variables,
             extensions: {
                 persistedQuery: {
                     version:1,
@@ -587,7 +637,14 @@ twitch-videoad.js text/javascript
                 }
             }
         };
-        return gqlRequest(body, playerType);
+        const response = await gqlRequest(body, playerType);
+        if (response.status === 200 && (await response.clone().text()).includes('PersistedQueryNotFound')) {
+            // Twitch rotated the persisted query hash. Send the query itself instead so we keep getting backup streams
+            console.log('PlaybackAccessToken persisted query was rejected, falling back to the full query');
+            UseFullAccessTokenQuery = true;
+            return gqlRequest(fullQueryBody, playerType);
+        }
+        return response;
     }
     function gqlRequest(body, playerType) {
         if (!gql_device_id) {
@@ -600,7 +657,8 @@ twitch-videoad.js text/javascript
         let headers = {
             'Client-Id': CLIENT_ID,
             'X-Device-Id': gql_device_id,
-            'Authorization': AuthorizationHeader,
+            // An 'Authorization: undefined' header gets the request rejected, which is what logged out viewers would send
+            ...(AuthorizationHeader && {'Authorization': AuthorizationHeader}),
             ...(ClientIntegrityHeader && {'Client-Integrity': ClientIntegrityHeader})
         };
         if (playerType.includes('-ALT')) {
@@ -666,31 +724,57 @@ twitch-videoad.js text/javascript
             };
         }
     }
+    function getHeaderValue(headers, name) {
+        // Twitch uses a plain object today, but the headers of a fetch can also be a Headers instance or an array of pairs
+        if (!headers) {
+            return undefined;
+        }
+        try {
+            if (typeof headers.get === 'function') {
+                const value = headers.get(name);
+                return value === null ? undefined : value;
+            }
+            if (Array.isArray(headers)) {
+                const pair = headers.find((x) => Array.isArray(x) && typeof x[0] === 'string' && x[0].toLowerCase() === name.toLowerCase());
+                return pair ? pair[1] : undefined;
+            }
+            if (headers[name] !== undefined) {
+                return headers[name];
+            }
+            const key = Object.keys(headers).find((x) => x.toLowerCase() === name.toLowerCase());
+            return key === undefined ? undefined : headers[key];
+        } catch {
+            return undefined;
+        }
+    }
     function hookFetch() {
         const realFetch = window.fetch;
         window.realFetch = realFetch;
         window.fetch = function(url, init, ...args) {
             if (typeof url === 'string') {
                 if (url.includes('gql')) {
-                    let deviceId = init.headers['X-Device-Id'];
+                    const headers = init ? init.headers : null;
+                    let deviceId = getHeaderValue(headers, 'X-Device-Id');
                     if (typeof deviceId !== 'string') {
-                        deviceId = init.headers['Device-ID'];
+                        deviceId = getHeaderValue(headers, 'Device-ID');
                     }
                     if (typeof deviceId === 'string' && gql_device_id != deviceId) {
                         gql_device_id = deviceId;
                         postTwitchWorkerMessage('UboUpdateDeviceId', gql_device_id);
                     }
-                    if (typeof init.headers['Client-Integrity'] === 'string' && init.headers['Client-Integrity'] !== ClientIntegrityHeader) {
-                        postTwitchWorkerMessage('UpdateClientIntegrityHeader', ClientIntegrityHeader = init.headers['Client-Integrity']);
+                    const clientIntegrity = getHeaderValue(headers, 'Client-Integrity');
+                    if (typeof clientIntegrity === 'string' && clientIntegrity !== ClientIntegrityHeader) {
+                        postTwitchWorkerMessage('UpdateClientIntegrityHeader', ClientIntegrityHeader = clientIntegrity);
                     }
-                    if (typeof init.headers['Authorization'] === 'string' && init.headers['Authorization'] !== AuthorizationHeader) {
-                        postTwitchWorkerMessage('UpdateAuthorizationHeader', AuthorizationHeader = init.headers['Authorization']);
+                    const authorization = getHeaderValue(headers, 'Authorization');
+                    if (typeof authorization === 'string' && authorization !== AuthorizationHeader) {
+                        postTwitchWorkerMessage('UpdateAuthorizationHeader', AuthorizationHeader = authorization);
                     }
                     // Get rid of mini player above chat - TODO: Reject this locally instead of having server reject it
                     if (init && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken') && init.body.includes('picture-by-picture')) {
                         init.body = '';
                     }
-                    if (OPT_FORCE_ACCESS_TOKEN_PLAYER_TYPE && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
+                    if (OPT_FORCE_ACCESS_TOKEN_PLAYER_TYPE && init && typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
                         let replacedPlayerType = '';
                         const newBody = JSON.parse(init.body);
                         if (Array.isArray(newBody)) {
