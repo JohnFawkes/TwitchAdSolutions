@@ -19,6 +19,11 @@ This needs to be fixed but currently the exact cause is unknown. https://github.
 
 If it says `Blocking ads (stripping)` in the top left of the stream then it's actively removing the ad segments but doesn't have a backup stream to show you. If it doesn't say `Blocking ads (stripping)` provide additional information in https://github.com/pixeltris/TwitchAdSolutions/issues/474
 
+This is most common on midrolls. A midroll break follows your signed in session, so asking for a new access token as `embed` / `popout` / `autoplay` tends to return the same ads on every one of them, leaving nothing clean to swap to. `vaft` handles this in two ways:
+
+- The `embed-ALT` entry in `BackupPlayerTypes` asks for the access token as a signed out viewer on a separate device id, which usually sits outside the break. It's tried last, so it only costs a request when the normal player types have all come back with ads. Remove it from `BackupPlayerTypes` if you'd rather it never requested a token without your account.
+- `MaxAdStrippingTime` (30000, in milliseconds) is how long the script will sit on stripped segments before reloading the player to try for a clean stream again. Lower it to retry sooner, raise it if the reloads are more disruptive than the wait, or set it to `0` to disable the retry and wait the break out.
+
 ## The script don't work on mobile (m.twitch.tv)
 
 There are no plans of implementing the scripts on m.twitch.tv but there are other solutions which blocking ads on Twitch for mobile. See https://github.com/JohnFawkes/TwitchAdSolutions/blob/master/full-list.md

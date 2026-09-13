@@ -2,7 +2,7 @@ twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
     'use strict';
-    const ourTwitchAdSolutionsVersion = 25;// Used to prevent conflicts with outdated versions of the scripts
+    const ourTwitchAdSolutionsVersion = 26;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
         window.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
@@ -16,6 +16,7 @@ twitch-videoad.js text/javascript
             'embed',//Source
             'popout',//Source
             'autoplay',//360p
+            'embed-ALT',//Source, requested as a signed out viewer on a different device id (-ALT is an internal suffix and is removed)
             //'picture-by-picture-CACHED'//360p (-CACHED is an internal suffix and is removed)
         ];
         scope.FallbackPlayerType = 'embed';
@@ -29,6 +30,7 @@ twitch-videoad.js text/javascript
         scope.StreamInfos = [];
         scope.StreamInfosByUrl = [];
         scope.GQLDeviceID = null;
+        scope.AltGQLDeviceID = null;// Device id used by '-ALT' player types. Regenerated for each ad break
         scope.ClientVersion = null;
         scope.ClientSession = null;
         scope.ClientIntegrityHeader = null;
@@ -46,6 +48,7 @@ twitch-videoad.js text/javascript
         scope.IsAdStrippingEnabled = true;
         scope.AdSegmentCache = new Map();
         scope.AllSegmentsAreAdSegments = false;
+        scope.MaxAdStrippingTime = 30000;// How long (in milliseconds) to sit on stripped ad segments with no clean stream before reloading the player to try for one again (0 disables)
         scope.DetectAdsBySegmentTitle = true;// Also treat a playlist as having ads when it contains segments which aren't titled 'live' (a fallback for when the ad daterange tag is missing / renamed)
         scope.RemoveAdTags = true;// Strip the ad metadata tags from the playlist handed to the player (stops the player running its own ad UI / ad timers when we can't swap to a clean stream)
         scope.UseFullAccessTokenQuery = false;// Set automatically when the PlaybackAccessToken persisted query hash is rejected
@@ -134,6 +137,7 @@ twitch-videoad.js text/javascript
                     ${declareOptions.toString()}
                     ${getAccessToken.toString()}
                     ${gqlRequest.toString()}
+                    ${generateDeviceId.toString()}
                     ${parseAttributes.toString()}
                     ${getWasmWorkerJs.toString()}
                     ${getServerTimeFromM3u8.toString()}
@@ -319,6 +323,7 @@ twitch-videoad.js text/javascript
                                             ActiveBackupPlayerType: null,
                                             IsMidroll: false,
                                             IsStrippingAdSegments: false,
+                                            StrippingSince: 0,
                                             NumStrippedAdSegments: 0
                                         };
                                         const lines = encodingsM3u8.replaceAll('\r', '').split('\n');
@@ -502,6 +507,8 @@ twitch-videoad.js text/javascript
             streamInfo.IsMidroll = textStr.includes('"MIDROLL"') || textStr.includes('"midroll"');
             if (!streamInfo.IsShowingAd) {
                 streamInfo.IsShowingAd = true;
+                streamInfo.StrippingSince = 0;
+                AltGQLDeviceID = null;// A new break wants a new signed out identity to escape it with
                 postMessage({
                     key: 'UpdateAdBlockBanner',
                     isMidroll: streamInfo.IsMidroll,
@@ -549,8 +556,7 @@ twitch-videoad.js text/javascript
             }
             for (let playerTypeIndex = startIndex; !backupM3u8 && playerTypeIndex < BackupPlayerTypes.length; playerTypeIndex++) {
                 const playerType = BackupPlayerTypes[playerTypeIndex];
-                const realPlayerType = playerType.replace('-CACHED', '');
-                const isFullyCachedPlayerType = playerType != realPlayerType;
+                const isFullyCachedPlayerType = playerType.includes('-CACHED');
                 for (let i = 0; i < 2; i++) {
                     // This caches the m3u8 if it doesn't have ads. If the already existing cache has ads it fetches a new version (second loop)
                     let isFreshM3u8 = false;
@@ -558,7 +564,7 @@ twitch-videoad.js text/javascript
                     if (!encodingsM3u8) {
                         isFreshM3u8 = true;
                         try {
-                            const accessTokenResponse = await getAccessToken(streamInfo.ChannelName, realPlayerType);
+                            const accessTokenResponse = await getAccessToken(streamInfo.ChannelName, playerType);
                             if (accessTokenResponse.status === 200) {
                                 const accessToken = await accessTokenResponse.json();
                                 const urlInfo = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + streamInfo.ChannelName + '.m3u8' + streamInfo.UsherParams);
@@ -620,9 +626,33 @@ twitch-videoad.js text/javascript
             if (IsAdStrippingEnabled || stripHevc) {
                 textStr = stripAdSegments(textStr, stripHevc, streamInfo);
             }
+            if (streamInfo.IsStrippingAdSegments) {
+                // Stripping means there's no clean stream to show, so the player just sits there buffering.
+                // Reload periodically instead of waiting out the whole break - each attempt is a fresh
+                // shot at a clean stream (and a fresh signed out identity for the '-ALT' player types)
+                if (!streamInfo.StrippingSince) {
+                    streamInfo.StrippingSince = Date.now();
+                }
+                if (MaxAdStrippingTime > 0 &&
+                    streamInfo.StrippingSince <= Date.now() - MaxAdStrippingTime &&
+                    streamInfo.LastPlayerReload <= Date.now() - MaxAdStrippingTime) {
+                    console.log('Still stripping ad segments, reloading the player to try for a clean stream');
+                    streamInfo.StrippingSince = Date.now();
+                    streamInfo.LastPlayerReload = Date.now();
+                    streamInfo.BackupEncodingsM3U8Cache = [];
+                    AltGQLDeviceID = null;
+                    postMessage({
+                        key: 'ReloadPlayer'
+                    });
+                }
+            } else {
+                streamInfo.StrippingSince = 0;
+            }
         } else if (streamInfo.IsShowingAd) {
             console.log('Finished blocking ads');
             streamInfo.IsShowingAd = false;
+            streamInfo.IsMidroll = false;
+            streamInfo.StrippingSince = 0;
             streamInfo.IsStrippingAdSegments = false;
             streamInfo.NumStrippedAdSegments = 0;
             streamInfo.ActiveBackupPlayerType = null;
@@ -661,13 +691,14 @@ twitch-videoad.js text/javascript
             }));
     }
     async function getAccessToken(channelName, playerType) {
+        const realPlayerType = playerType.replace('-CACHED', '').replace('-ALT', '');
         const variables = {
             isLive: true,
             login: channelName,
             isVod: false,
             vodID: "",
-            playerType: playerType,
-            platform: playerType == 'autoplay' ? 'android' : 'web'
+            playerType: realPlayerType,
+            platform: realPlayerType == 'autoplay' ? 'android' : 'web'
         };
         const fullQueryBody = {
             operationName: 'PlaybackAccessToken_Template',
@@ -699,16 +730,30 @@ twitch-videoad.js text/javascript
         }
         return response;
     }
+    function generateDeviceId() {
+        let deviceId = '';
+        const dcharacters = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        const dcharactersLength = dcharacters.length;
+        for (let i = 0; i < 32; i++) {
+            deviceId += dcharacters.charAt(Math.floor(Math.random() * dcharactersLength));
+        }
+        return deviceId;
+    }
     function gqlRequest(body, playerType) {
         if (!GQLDeviceID) {
-            GQLDeviceID = '';
-            const dcharacters = 'abcdefghijklmnopqrstuvwxyz0123456789';
-            const dcharactersLength = dcharacters.length;
-            for (let i = 0; i < 32; i++) {
-                GQLDeviceID += dcharacters.charAt(Math.floor(Math.random() * dcharactersLength));
-            }
+            GQLDeviceID = generateDeviceId();
         }
-        let headers = {
+        // A midroll break follows the signed in session, so every normal player type returns the same ads.
+        // '-ALT' asks as a signed out viewer on a different device id, which is usually outside that break
+        const isAltPlayerType = typeof playerType === 'string' && playerType.includes('-ALT');
+        if (isAltPlayerType && !AltGQLDeviceID) {
+            AltGQLDeviceID = generateDeviceId();
+        }
+        const headers = isAltPlayerType ? {
+            'Client-ID': ClientID,
+            'X-Device-Id': AltGQLDeviceID,
+            ...(ClientVersion && {'Client-Version': ClientVersion})
+        } : {
             'Client-ID': ClientID,
             'X-Device-Id': GQLDeviceID,
             // An 'Authorization: undefined' header gets the request rejected, which is what logged out viewers would send
@@ -829,6 +874,9 @@ twitch-videoad.js text/javascript
         setTimeout(monitorPlayerBuffering, PlayerBufferingDelay);
     }
     function updateAdblockBanner(data) {
+        // Tracked outside the div check below - if the player div is missing when a break ends
+        // this stays true and the buffering mitigation stays disabled long after the ads are gone
+        isActivelyStrippingAds = !!data.isStrippingAdSegments;
         const playerRootDiv = document.querySelector('.video-player');
         if (playerRootDiv != null) {
             let adBlockDiv = null;
@@ -842,7 +890,6 @@ twitch-videoad.js text/javascript
                 playerRootDiv.appendChild(adBlockDiv);
             }
             if (adBlockDiv != null) {
-                isActivelyStrippingAds = data.isStrippingAdSegments;
                 adBlockDiv.P.textContent = 'Blocking' + (data.isMidroll ? ' midroll' : '') + ' ads' + (data.isStrippingAdSegments ? ' (stripping)' : '');// + (data.numStrippedAdSegments > 0 ? ` (${data.numStrippedAdSegments})` : '');
                 adBlockDiv.style.display = data.hasAds && playerBufferState.isLive ? 'block' : 'none';
             }
